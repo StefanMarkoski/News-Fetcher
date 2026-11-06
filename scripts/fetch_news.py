@@ -203,6 +203,7 @@ class NewsClient:
             backoff = _backoff(attempt)
             try:
                 async with self.session.get(API_BASE_URL + path, params=params) as response:
+                    self._follow_api_quota(response.headers)
                     if response.status == 200:
                         payload = await response.json(content_type=None)
                         if not isinstance(payload, dict):
@@ -222,6 +223,14 @@ class NewsClient:
                 log.warning("%s: %s (attempt %d)", path, type(exc).__name__, attempt + 1)
             await asyncio.sleep(backoff)
         raise ApiError(f"{path}: gave up after {MAX_ATTEMPTS} attempts")
+
+    def _follow_api_quota(self, headers: Any) -> None:
+        """The API's count is the real one: its 24-hour window starts at the first
+        request rather than at midnight, and it includes requests made elsewhere.
+        """
+        remaining = headers.get("X-RateLimit-Remaining-Day")
+        if remaining is not None and remaining.isdigit():
+            self.budget = min(self.budget, self.used + int(remaining))
 
     def _handle_rate_limit(self, retry_after: str | None, backoff: float) -> None:
         delay = _parse_retry_after(retry_after)
@@ -463,9 +472,9 @@ def _google_translate(text: str) -> str | None:
 
 
 class Paginator:
-    """The docs show next_cursor and next_offset in responses but never name the
-    request parameter. Starts with `cursor` and switches to `offset` for the rest
-    of the run if the API rejects or ignores it.
+    """The docs never name the paging request parameter. Both `cursor` and `offset`
+    worked when tested against the live API. Starts with `cursor` and switches to
+    `offset` for the rest of the run if the API ever rejects or ignores it.
     """
 
     def __init__(self) -> None:
@@ -678,7 +687,8 @@ async def warn_if_database_is_large(store: SupabaseStore) -> None:
 
 async def run_cycle(store: SupabaseStore, api_key: str) -> int:
     now = datetime.now(timezone.utc)
-    day = now.strftime("%Y-%m-%d")  # assumes the API's daily quota resets at UTC midnight
+    # Our own running total, which caps re-runs. NewsClient also follows the API's count.
+    day = now.strftime("%Y-%m-%d")
     cutoff = now - timedelta(days=RETENTION_DAYS)
     stats = Stats()
 
