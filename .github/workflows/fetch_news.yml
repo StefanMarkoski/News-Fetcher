@@ -1,0 +1,48 @@
+name: Fetch news
+
+on:
+  schedule:
+    # Four cycles a day, off the top of the hour, when GitHub's queue is busiest.
+    # Times are UTC, and GitHub can still start a run late.
+    - cron: "17 0,6,12,18 * * *"
+  workflow_dispatch:
+
+# A second run at the same time would double-spend the API quota.
+concurrency:
+  group: fetch-news
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write # only for the keep-alive step below
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch, translate and store news
+        env:
+          FREENEWS_API_KEY: ${{ secrets.FREENEWS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: python scripts/fetch_news.py
+
+      # GitHub disables scheduled workflows after 60 days without repository
+      # activity, and an unattended data pipeline has none.
+      - name: Keep the schedule enabled
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/fetch_news.yml/enable"

@@ -1,0 +1,7 @@
+# This repository is public: never commit credentials.
+.env
+.env.*
+
+__pycache__/
+*.pyc
+.venv/
