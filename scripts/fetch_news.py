@@ -6,11 +6,14 @@ One run:
   2. Reserves its API budget against a daily counter kept in Supabase.
   3. Reads the English world and politics feeds, newest first, until it reaches
      articles it already has (at most 100 list requests).
-  4. Fetches each new article (at most 1,000 detail requests), and stores a card
+  4. Fetches each new article (at most 1,000 detail requests) and builds a card
      with an excerpt of whole sentences, tagged with the anchor countries it is
      about. The full article text is never stored: the provider's terms restrict
      republishing it, so readers continue at the source.
-  5. Warns if the database is getting close to the free plan's limit.
+  5. Merges articles covering the same story into one card that lists every
+     publisher and its link. The number of publishers ranks the top stories,
+     because the API has no popularity data.
+  6. Warns if the database is getting close to the free plan's limit.
 
 The API's country filter can't drive this: combined with language=en it returns
 nothing for Russia, China, Germany or Ukraine, and its tags don't reflect what an
@@ -58,11 +61,12 @@ COUNTRY_TERMS = {
     r"\bAmerica(?:ns?|['’]s)?\b|\bWashington\b|White House|\bTrump\b|Pentagon",
     "RU": r"\bRussian?s?\b|\bMoscow\b|\bKremlin\b|\bPutin\b",
     "CN": r"\bChina\b|\bChinese\b|\bBeijing\b|Xi Jinping",
-    "GB": r"\bUK\b|\bBritain\b|\bBritish\b(?! Columbia)|\bEngland\b|\bLondon\b|\bStarmer\b|Downing Street",
-    "DE": r"\bGerman(?:y|s)?\b|\bBerlin\b|\bMerz\b",
-    "IN": r"\bIndia\b|\bIndians?\b(?! (?:Act|Ocean|Reservation|Country))|New Delhi|\bModi\b",
-    "UA": r"\bUkrain(?:e|ian|ians)\b|\bKyiv\b|\bZelensk",
-    "IL": r"\bIsrael(?:i|is)?\b|\bGaza\b|\bNetanyahu\b|Tel Aviv|\bJerusalem\b",
+    "GB": r"\bUK\b|\bBritain\b|\bBritish\b(?! Columbia)|\bEngland\b|\bLondon\b|\bStarmer\b|Downing Street|\bScotland\b|\bWales\b|\bWestminster\b",
+    "DE": r"\bGerman(?:y|s)?\b|\bBerlin\b|\bMerz\b|\bBundestag\b|\bMunich\b|\bHamburg\b",
+    "IN": r"\bIndia\b|\bIndians?\b(?! (?:Act|Ocean|Reservation|Country))|\bDelhi\b|\bMumbai\b|\bModi\b|"
+    r"\bBJP\b|Lok Sabha|Rajya Sabha|\bMaharashtra\b|\bKerala\b|\bBihar\b|Tamil Nadu",
+    "UA": r"\bUkrain(?:e|ian|ians)\b|\bKyiv\b|\bZelensk|\bDonbas\b|\bOdesa\b|\bKharkiv\b",
+    "IL": r"\bIsrael(?:i|is)?\b|\bGaza\b|\bNetanyahu\b|Tel Aviv|\bJerusalem\b|\bIDF\b|\bKnesset\b",
 }
 _COUNTRY_PATTERNS = {code: re.compile(terms) for code, terms in COUNTRY_TERMS.items()}
 # A title mention always counts. In the excerpt, one passing mention isn't enough.
@@ -94,7 +98,21 @@ MIN_EXCERPT_CHARS = 100
 RETENTION_DAYS = 7
 SIZE_WARNING_BYTES = 400 * 1024 * 1024  # free plan limit is 500 MB
 
+# Two titles are the same story if this share of their meaningful words match.
+STORY_MATCH_SIMILARITY = 0.4
+STORY_MIN_TITLE_WORDS = 3
+# Only recent stories can gain sources, or an old headline could absorb new events.
+STORY_WINDOW_HOURS = 48
+STORIES_PER_READ = 1_000
+_TITLE_WORD = re.compile(r"[a-z0-9']+")
+_TITLE_STOPWORDS = frozenset(
+    "the a an of in on at to for and or with from by as is are was were be after over into "
+    "his her its their says said new how why what who will has have not more than about amid "
+    "this that it".split()
+)
+
 ARTICLES_PATH = "/rest/v1/articles"
+SEEN_PATH = "/rest/v1/seen_articles"
 QUOTA_PATH = "/rest/v1/api_quota"
 DATABASE_SIZE_PATH = "/rest/v1/rpc/database_size_bytes"
 ARTICLES_PER_WRITE = 200
@@ -307,30 +325,58 @@ class SupabaseStore:
         raise StoreError(f"{method} {path}: gave up after {MAX_ATTEMPTS} attempts")
 
     async def existing_ids(self, ids: list[str]) -> set[str]:
+        """Articles merged into a story have no row of their own, so this checks
+        every article ever handled, not only the stories.
+        """
         found: set[str] = set()
         for chunk in _chunks(ids, EXISTENCE_CHECK_CHUNK):
             quoted = ",".join(f'"{article_id}"' for article_id in chunk)
             rows, _ = await self._request(
-                "GET", ARTICLES_PATH, params={"select": "id", "id": f"in.({quoted})"}
+                "GET", SEEN_PATH, params={"select": "id", "id": f"in.({quoted})"}
             )
             found.update(row["id"] for row in rows or [])
         return found
 
+    async def recent_stories(self, since: datetime) -> list[dict[str, Any]]:
+        stories: list[dict[str, Any]] = []
+        while True:
+            rows, _ = await self._request(
+                "GET",
+                ARTICLES_PATH,
+                params={
+                    "select": "*",
+                    "ingested_at": f"gte.{_query_time(since)}",
+                    "order": "id",
+                    "limit": str(STORIES_PER_READ),
+                    "offset": str(len(stories)),
+                },
+            )
+            stories.extend(rows or [])
+            if len(rows or []) < STORIES_PER_READ:
+                return stories
+
     async def write_articles(self, rows: list[dict[str, Any]]) -> None:
+        await self._upsert(ARTICLES_PATH, rows)
+
+    async def mark_seen(self, article_ids: list[str], now: datetime) -> None:
+        await self._upsert(
+            SEEN_PATH, [{"id": article_id, "ingested_at": now.isoformat()} for article_id in article_ids]
+        )
+
+    async def _upsert(self, path: str, rows: list[dict[str, Any]]) -> None:
         await self._request(
             "POST",
-            ARTICLES_PATH,
+            path,
             params={"on_conflict": "id"},
             body=rows,
             prefer="resolution=merge-duplicates,return=minimal",
         )
 
     async def purge_older_than(self, cutoff: datetime) -> int:
+        expired = {"ingested_at": f"lt.{_query_time(cutoff)}"}
+        await self._request("DELETE", SEEN_PATH, params=expired, prefer="return=minimal")
         _, headers = await self._request(
-            "DELETE",
-            ARTICLES_PATH,
-            params={"ingested_at": f"lt.{cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')}"},
-            prefer="return=minimal,count=exact",
+            "DELETE", ARTICLES_PATH, params=expired, prefer="return=minimal,count=exact"
         )
         # The header looks like "*/123".
         total = (headers.get("Content-Range") or "").rpartition("/")[2]
@@ -365,7 +411,8 @@ class Stats:
     not_english: int = 0
     without_excerpt: int = 0
     untagged: int = 0
-    written: int = 0
+    new_stories: int = 0
+    merged: int = 0
     failed: int = 0
     write_failures: int = 0
     purged: int = 0
@@ -440,6 +487,57 @@ def tag_countries(title: str, excerpt: str) -> list[str]:
     ]
 
 
+def title_words(title: str) -> frozenset[str]:
+    return frozenset(
+        word
+        for word in _TITLE_WORD.findall(title.lower())
+        if len(word) > 2 and word not in _TITLE_STOPWORDS
+    )
+
+
+def is_same_story(first: frozenset[str], second: frozenset[str]) -> bool:
+    if len(first) < STORY_MIN_TITLE_WORDS or len(second) < STORY_MIN_TITLE_WORDS:
+        return False
+    return len(first & second) / len(first | second) >= STORY_MATCH_SIMILARITY
+
+
+class StoryIndex:
+    """Recent stories, matched by the words in any headline they've collected."""
+
+    def __init__(self, stories: Iterable[dict[str, Any]]) -> None:
+        self.stories: list[dict[str, Any]] = []
+        self.headlines: list[list[frozenset[str]]] = []
+        for story in stories:
+            self._track(story)
+
+    def _track(self, story: dict[str, Any]) -> None:
+        self.stories.append(story)
+        self.headlines.append([title_words(source["title"]) for source in story["sources"]])
+
+    def add(self, article: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Returns the story now holding this article, and whether it was merged."""
+        words = title_words(article["title"])
+        for position, headlines in enumerate(self.headlines):
+            if any(is_same_story(words, headline) for headline in headlines):
+                story = self.stories[position]
+                merge_into_story(story, article)
+                headlines.append(words)
+                return story, True
+        self._track(article)
+        return article, False
+
+
+def merge_into_story(story: dict[str, Any], article: dict[str, Any]) -> None:
+    publishers = {source["name"] for source in story["sources"]}
+    story["sources"].extend(s for s in article["sources"] if s["name"] not in publishers)
+    story["source_count"] = len(story["sources"])
+    countries = set(story["country_codes"]) | set(article["country_codes"])
+    story["country_codes"] = [code for code in COUNTRY_TERMS if code in countries]
+    story["topics"] = sorted(set(story["topics"]) | set(article["topics"]))
+    story["excerpt"] = story["excerpt"] or article["excerpt"]
+    story["thumbnail_url"] = story["thumbnail_url"] or article["thumbnail_url"]
+
+
 def parse_timestamp(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -468,6 +566,10 @@ def _parse_retry_after(value: str | None) -> float | None:
         return max(0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
     except (TypeError, ValueError):
         return None
+
+
+def _query_time(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _backoff(attempt: int) -> float:
@@ -611,23 +713,43 @@ async def build_row(
     return {
         "id": uuid,
         "title": title,
-        "source": detail.get("publisher") or item.get("publisher") or "",
         "published_at": published.isoformat(),
         "country_codes": countries,
         "excerpt": excerpt,
         "thumbnail_url": http_url(detail.get("thumbnail")),
         "topics": detail.get("topics") or [],
-        "original_url": http_url(detail.get("original_url")),
+        "sources": [
+            {
+                "name": detail.get("publisher") or item.get("publisher") or "",
+                "url": http_url(detail.get("original_url")),
+                "title": title,
+                "published_at": published.isoformat(),
+            }
+        ],
+        "source_count": 1,
         "ingested_at": now.isoformat(),
     }
 
 
-async def flush(store: SupabaseStore, buffer: list[dict[str, Any]], stats: Stats) -> None:
+async def flush(
+    store: SupabaseStore, index: StoryIndex, buffer: list[dict[str, Any]], stats: Stats, now: datetime
+) -> None:
     if not buffer:
         return
+    article_ids = [article["id"] for article in buffer]
+    changed: dict[str, dict[str, Any]] = {}
+    new_stories = merged = 0
+    for article in buffer:
+        story, was_merged = index.add(article)
+        changed[story["id"]] = story
+        merged += was_merged
+        new_stories += not was_merged
     try:
-        await store.write_articles(buffer)
-        stats.written += len(buffer)
+        await store.write_articles(list(changed.values()))
+        # Marked only once stored, so a failed write is fetched again next cycle.
+        await store.mark_seen(article_ids, now)
+        stats.new_stories += new_stories
+        stats.merged += merged
     except StoreError as exc:
         stats.write_failures += len(buffer)
         log.error("Could not write %d articles: %s", len(buffer), exc)
@@ -639,6 +761,8 @@ async def ingest(
 ) -> None:
     pending = await discover(client, store, stats, cutoff)
     log.info("%d listed, %d already stored, %d to fetch", stats.listed, stats.already_stored, len(pending))
+    since = now - timedelta(hours=STORY_WINDOW_HOURS)
+    index = StoryIndex(await store.recent_stories(since) if pending else [])
 
     semaphore = asyncio.Semaphore(ARTICLE_CONCURRENCY)
 
@@ -661,8 +785,8 @@ async def ingest(
         if row is not None:
             buffer.append(row)
         if len(buffer) >= ARTICLES_PER_WRITE:
-            await flush(store, buffer, stats)
-    await flush(store, buffer, stats)
+            await flush(store, index, buffer, stats, now)
+    await flush(store, index, buffer, stats, now)
 
 
 async def warn_if_database_is_large(store: SupabaseStore) -> None:
