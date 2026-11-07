@@ -13,7 +13,7 @@ One run:
   5. Warns if the database is getting close to the free plan's limit.
 
 The API's country filter can't drive this: combined with language=en it returns
-nothing for six of the ten anchor countries, and its tags don't reflect what an
+nothing for Russia, China, Germany or Ukraine, and its tags don't reflect what an
 article is about. So countries are tagged from the article's own text instead.
 
 The tables are defined in supabase/schema.sql.
@@ -61,10 +61,8 @@ COUNTRY_TERMS = {
     "GB": r"\bUK\b|\bBritain\b|\bBritish\b(?! Columbia)|\bEngland\b|\bLondon\b|\bStarmer\b|Downing Street",
     "DE": r"\bGerman(?:y|s)?\b|\bBerlin\b|\bMerz\b",
     "IN": r"\bIndia\b|\bIndians?\b(?! (?:Act|Ocean|Reservation|Country))|New Delhi|\bModi\b",
-    "JP": r"\bJapan(?:ese)?\b|\bTokyo\b",
     "UA": r"\bUkrain(?:e|ian|ians)\b|\bKyiv\b|\bZelensk",
     "IL": r"\bIsrael(?:i|is)?\b|\bGaza\b|\bNetanyahu\b|Tel Aviv|\bJerusalem\b",
-    "BR": r"\bBrazil(?:ian|ians)?\b|\bLula\b|\bBras[ií]lia\b|S[aã]o Paulo",
 }
 _COUNTRY_PATTERNS = {code: re.compile(terms) for code, terms in COUNTRY_TERMS.items()}
 # A title mention always counts. In the excerpt, one passing mention isn't enough.
