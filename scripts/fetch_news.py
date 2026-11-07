@@ -139,10 +139,13 @@ _PAGE_TEXT = re.compile(
 )
 
 
-# Timestamps that some sites put in front of the first sentence.
-_TIMESTAMP_PREFIX = re.compile(
-    r"^(?:\s*(?:Published|Updated|Posted):? [A-Z][a-z]+\.? \d{1,2}, \d{4},? "
-    r"\d{1,2}:\d{2} ?[ap]\.?m\.?(?: [A-Z]{2,4})?)+\s*"
+# Page text that some sites run straight into the first sentence.
+_LEAD_IN = re.compile(
+    r"^(?:\s*(?:"
+    r"(?:Published|Updated|Posted):? [A-Z][a-z]+\.? \d{1,2}, \d{4},? \d{1,2}:\d{2} ?[ap]\.?m\.?(?: [A-Z]{2,4})?|"
+    r"By [A-Z][a-z]+\.? \d{1,2}, \d{4} / \d{1,2}:\d{2} [AP]M [A-Z]{2,4} / .{2,40}? Add .{2,40}? on Google|"
+    r"(?i:watch now|open this photo in gallery:?|listen to this article:?|in brief)"
+    r"))+\s*"
 )
 
 
@@ -463,7 +466,7 @@ def make_excerpt(body: str) -> str:
     """Whole sentences only. The limit is MAX_EXCERPT_SENTENCES, or a share of the
     article's real sentences if that is fewer. Empty if no real story text remains.
     """
-    body = _TIMESTAMP_PREFIX.sub("", body)
+    body = _LEAD_IN.sub("", body)
     sentences = [s for s in split_sentences(body) if is_story_sentence(s)]
     limit = min(MAX_EXCERPT_SENTENCES, math.ceil(len(sentences) * MAX_EXCERPT_SHARE))
 
