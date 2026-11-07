@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Fetch, translate and store one news cycle from FreeNewsApi.io into Supabase.
+"""Fetch one news cycle of English world and politics articles into Supabase.
 
 One run:
   1. Purges articles ingested more than RETENTION_DAYS ago.
   2. Reserves its API budget against a daily counter kept in Supabase.
-  3. Lists up to 100 articles per anchor country (at most 100 list requests).
-  4. Skips articles already stored, then fetches the rest (at most 1,000 detail
-     requests), translates the title and opening text, and stores a card with an
-     excerpt of whole sentences. The full article text is never stored: the
-     provider's terms restrict republishing it, so readers continue at the source.
+  3. Reads the English world and politics feeds, newest first, until it reaches
+     articles it already has (at most 100 list requests).
+  4. Fetches each new article (at most 1,000 detail requests), and stores a card
+     with an excerpt of whole sentences, tagged with the anchor countries it is
+     about. The full article text is never stored: the provider's terms restrict
+     republishing it, so readers continue at the source.
   5. Warns if the database is getting close to the free plan's limit.
+
+The API's country filter can't drive this: combined with language=en it returns
+nothing for six of the ten anchor countries, and its tags don't reflect what an
+article is about. So countries are tagged from the article's own text instead.
 
 The tables are defined in supabase/schema.sql.
 
@@ -39,20 +44,35 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Iterable
 
 import aiohttp
-from deep_translator import GoogleTranslator
 
 API_BASE_URL = "https://api.freenewsapi.io"
 
-# ISO alpha-2, as the API reports countries. The UK is "GB" there.
-ANCHOR_COUNTRIES = ("US", "RU", "CN", "GB", "DE", "IN", "JP", "UA", "IL", "BR")
-
-ARTICLES_PER_COUNTRY = 100
-MAX_LIST_PAGES_PER_COUNTRY = 10
+FEED_TOPICS = ("world", "politics")
+MAX_LIST_PAGES_PER_FEED = 50
 MAX_REQUESTS_PER_CYCLE = 1_100
 DAILY_REQUEST_QUOTA = 5_000
 
-# The API allows 2 req/sec. Stay just under it; a full cycle takes about 10 minutes.
-REQUEST_INTERVAL_SECONDS = 0.55
+# Which articles belong to which anchor country. ISO alpha-2, so the UK is GB.
+COUNTRY_TERMS = {
+    "US": r"U\.S\.|\bUS\b|\bUSA\b|United States|(?<!South )(?<!Latin )(?<!Central )(?<!North )"
+    r"\bAmerica(?:ns?|['’]s)?\b|\bWashington\b|White House|\bTrump\b|Pentagon",
+    "RU": r"\bRussian?s?\b|\bMoscow\b|\bKremlin\b|\bPutin\b",
+    "CN": r"\bChina\b|\bChinese\b|\bBeijing\b|Xi Jinping",
+    "GB": r"\bUK\b|\bBritain\b|\bBritish\b(?! Columbia)|\bEngland\b|\bLondon\b|\bStarmer\b|Downing Street",
+    "DE": r"\bGerman(?:y|s)?\b|\bBerlin\b|\bMerz\b",
+    "IN": r"\bIndia\b|\bIndians?\b(?! (?:Act|Ocean|Reservation|Country))|New Delhi|\bModi\b",
+    "JP": r"\bJapan(?:ese)?\b|\bTokyo\b",
+    "UA": r"\bUkrain(?:e|ian|ians)\b|\bKyiv\b|\bZelensk",
+    "IL": r"\bIsrael(?:i|is)?\b|\bGaza\b|\bNetanyahu\b|Tel Aviv|\bJerusalem\b",
+    "BR": r"\bBrazil(?:ian|ians)?\b|\bLula\b|\bBras[ií]lia\b|S[aã]o Paulo",
+}
+_COUNTRY_PATTERNS = {code: re.compile(terms) for code, terms in COUNTRY_TERMS.items()}
+# A title mention always counts. In the excerpt, one passing mention isn't enough.
+MIN_EXCERPT_MENTIONS = 2
+
+# The API allows 2 req/sec, but a live run at 0.55s still drew 429s, about 5% of
+# requests. A full cycle takes about 12 minutes at this pace.
+REQUEST_INTERVAL_SECONDS = 0.65
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_ATTEMPTS = 4
 MAX_BACKOFF_SECONDS = 60
@@ -63,19 +83,15 @@ MAX_CONSECUTIVE_RATE_LIMITS = 12
 # Articles in flight at once. Pacing comes from the rate limiter, not from this.
 ARTICLE_CONCURRENCY = 6
 
-TRANSLATION_CONCURRENCY = 3
-TRANSLATION_TIMEOUT_SECONDS = 60
-TRANSLATION_ATTEMPTS = 3
-MAX_CONSECUTIVE_TRANSLATION_FAILURES = 8
-
 MAX_EXCERPT_SENTENCES = 10
 # Short articles get a proportional excerpt, so it never replaces the original.
 MAX_EXCERPT_SHARE = 1 / 3
-# Only articles with very long or unpunctuated sentences ever reach this.
 MAX_EXCERPT_CHARS = 2_500
-# Enough source text for ten sentences, and under deep_translator's 5,000 limit.
-EXCERPT_SOURCE_CHARS = 4_500
-MAX_TITLE_CHARS = 500
+# Longer runs of text with no sentence ending are page menus, not sentences.
+MAX_SENTENCE_CHARS = 500
+MIN_SENTENCE_WORDS = 4
+# With fewer than this, the card shows only the title, image and link.
+MIN_EXCERPT_CHARS = 100
 
 RETENTION_DAYS = 7
 SIZE_WARNING_BYTES = 400 * 1024 * 1024  # free plan limit is 500 MB
@@ -89,16 +105,29 @@ EXISTENCE_CHECK_CHUNK = 100  # keeps the id=in.(...) URL at a safe length
 log = logging.getLogger("fetch_news")
 
 # A sentence ends at terminal punctuation plus any closing quote or bracket, then
-# whitespace or the end of the text. Chinese and Japanese punctuation needs no
-# space after it. A line break also ends one, which covers unpunctuated subheadings.
-_SENTENCE_END = re.compile(
-    r"""[.!?…]+["'”’)\]»]*(?:\s+|$)|[。！？]+["'”’）」』]*\s*|\n+"""
-)
+# whitespace or the end of the text. A line break also ends one.
+_SENTENCE_END = re.compile(r"""[.!?…]+["'”’)\]»]*(?:\s+|$)|\n+""")
+_COMPLETE_SENTENCE = re.compile(r"""[.!?…]["'”’)\]»]*$""")
 _ABBREVIATIONS = frozenset(
     "mr mrs ms dr prof sen rep gov gen col lt sgt capt st jr sr vs no inc ltd co corp "
     "jan feb mar apr jun jul aug sep sept oct nov dec".split()
 )
 _INITIALISM = re.compile(r"(?:^|[\s(])(?:[A-Za-z]\.)+$")
+# Page furniture that the API sometimes returns as part of an article's body.
+_PAGE_TEXT = re.compile(
+    r"skip to (?:main )?content|all rights reserved|©|couldn.t load|enable javascript|"
+    r"opens in a new (?:window|tab)|sign up|subscribe|newsletter|\blog ?in\b|\bcookies?\b|"
+    r"advertisement|read more|click here|follow us|share this|terms of (?:use|service)|"
+    r"privacy policy|photo:|image (?:source|caption)|getty images|click the|loading\.\.\.",
+    re.IGNORECASE,
+)
+
+
+# Timestamps that some sites put in front of the first sentence.
+_TIMESTAMP_PREFIX = re.compile(
+    r"^(?:\s*(?:Published|Updated|Posted):? [A-Z][a-z]+\.? \d{1,2}, \d{4},? "
+    r"\d{1,2}:\d{2} ?[ap]\.?m\.?(?: [A-Z]{2,4})?)+\s*"
+)
 
 
 class StopIngestion(Exception):
@@ -112,10 +141,6 @@ class ApiError(Exception):
 
 
 class StoreError(Exception):
-    pass
-
-
-class TranslationFailed(Exception):
     pass
 
 
@@ -178,7 +203,7 @@ class RateLimiter:
 
 class NewsClient:
     """Paced API client. Every attempt, retries included, counts against the
-    budget because the API does not document whether failed requests use quota.
+    budget, which keeps it a true ceiling on requests sent.
     """
 
     def __init__(self, session: aiohttp.ClientSession, budget: int, stop: StopSignal) -> None:
@@ -242,36 +267,6 @@ class NewsClient:
         delay = delay if delay is not None else backoff
         log.warning("HTTP 429, pausing all requests for %.1fs", delay)
         self.limiter.pause(delay)
-
-
-class Translator:
-    """deep_translator is blocking, so calls run in worker threads."""
-
-    def __init__(self, stop: StopSignal) -> None:
-        self.semaphore = asyncio.Semaphore(TRANSLATION_CONCURRENCY)
-        self.failures = FailureStreak(
-            MAX_CONSECUTIVE_TRANSLATION_FAILURES,
-            "translation keeps failing, stopping before more API quota is spent",
-            stop,
-        )
-
-    async def to_english(self, text: str) -> str:
-        if not text.strip():
-            return text
-        for attempt in range(TRANSLATION_ATTEMPTS):
-            try:
-                async with self.semaphore:
-                    translated = await asyncio.wait_for(
-                        asyncio.to_thread(_google_translate, text),
-                        TRANSLATION_TIMEOUT_SECONDS,
-                    )
-                if translated:
-                    return translated
-                log.warning("Translator returned nothing (attempt %d)", attempt + 1)
-            except Exception as exc:  # deep_translator has no common error base class
-                log.warning("Translation failed: %s (attempt %d)", type(exc).__name__, attempt + 1)
-            await asyncio.sleep(_backoff(attempt))
-        raise TranslationFailed("translation failed")
 
 
 class SupabaseStore:
@@ -369,7 +364,9 @@ class Stats:
     already_stored: int = 0
     too_old: int = 0
     fetched: int = 0
-    translated: int = 0
+    not_english: int = 0
+    without_excerpt: int = 0
+    untagged: int = 0
     written: int = 0
     failed: int = 0
     write_failures: int = 0
@@ -405,27 +402,44 @@ def _is_false_sentence_end(candidate: str, next_char: str) -> bool:
     return last_word in _ABBREVIATIONS or bool(_INITIALISM.search(candidate))
 
 
-def make_excerpt(english: str, total_sentences: int, source_was_cut: bool) -> str:
+def is_story_sentence(sentence: str) -> bool:
+    """False for page furniture: menus, legal lines, error notices, unfinished text."""
+    words = sentence.split()
+    if len(words) < MIN_SENTENCE_WORDS or len(sentence) > MAX_SENTENCE_CHARS:
+        return False
+    if not _COMPLETE_SENTENCE.search(sentence) or _PAGE_TEXT.search(sentence):
+        return False
+    # Menus read as a run of capitalised labels.
+    capitalised = sum(word[0].isupper() for word in words)
+    return not (len(words) >= 8 and capitalised / len(words) > 0.7)
+
+
+def make_excerpt(body: str) -> str:
     """Whole sentences only. The limit is MAX_EXCERPT_SENTENCES, or a share of the
-    original article (counted before translation) if that is fewer.
+    article's real sentences if that is fewer. Empty if no real story text remains.
     """
-    sentences = split_sentences(english)
-    if source_was_cut and len(sentences) > 1:
-        sentences.pop()  # the source was cut, so its last sentence may be partial
-    limit = min(MAX_EXCERPT_SENTENCES, max(1, math.ceil(total_sentences * MAX_EXCERPT_SHARE)))
+    body = _TIMESTAMP_PREFIX.sub("", body)
+    sentences = [s for s in split_sentences(body) if is_story_sentence(s)]
+    limit = min(MAX_EXCERPT_SENTENCES, math.ceil(len(sentences) * MAX_EXCERPT_SHARE))
 
     picked: list[str] = []
     length = 0
     for sentence in sentences[:limit]:
-        if picked and length + 1 + len(sentence) > MAX_EXCERPT_CHARS:
+        if length + len(sentence) + 1 > MAX_EXCERPT_CHARS:
             break
         picked.append(sentence)
         length += len(sentence) + 1
 
     excerpt = " ".join(picked)
-    if len(excerpt) > MAX_EXCERPT_CHARS:  # a single sentence over the limit
-        excerpt = excerpt[:MAX_EXCERPT_CHARS].rsplit(" ", 1)[0] + "…"
-    return excerpt
+    return excerpt if len(excerpt) >= MIN_EXCERPT_CHARS else ""
+
+
+def tag_countries(title: str, excerpt: str) -> list[str]:
+    return [
+        code
+        for code, pattern in _COUNTRY_PATTERNS.items()
+        if pattern.search(title) or len(pattern.findall(excerpt)) >= MIN_EXCERPT_MENTIONS
+    ]
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -467,10 +481,6 @@ def _chunks(items: list[Any], size: int) -> Iterable[list[Any]]:
         yield items[start : start + size]
 
 
-def _google_translate(text: str) -> str | None:
-    return GoogleTranslator(source="auto", target="en").translate(text)
-
-
 class Paginator:
     """The docs never name the paging request parameter. Both `cursor` and `offset`
     worked when tested against the live API. Starts with `cursor` and switches to
@@ -492,29 +502,36 @@ class Paginator:
         self.use_cursor = False
 
 
-async def list_country(
-    client: NewsClient, country: str, paginator: Paginator
+async def read_feed(
+    client: NewsClient,
+    store: SupabaseStore,
+    topic: str,
+    paginator: Paginator,
+    cutoff: datetime,
+    stats: Stats,
 ) -> dict[str, dict[str, Any]]:
-    found: dict[str, dict[str, Any]] = {}
+    """Returns new articles. Feeds run newest first, so reading stops at the first
+    page with nothing new, which keeps a normal cycle well under its budget.
+    """
+    seen: set[str] = set()
+    pending: dict[str, dict[str, Any]] = {}
     params: dict[str, Any] = {}
     previous_meta: dict[str, Any] = {}
 
-    for _ in range(MAX_LIST_PAGES_PER_COUNTRY):
-        if len(found) >= ARTICLES_PER_COUNTRY:
-            break
+    for _ in range(MAX_LIST_PAGES_PER_FEED):
         try:
-            payload = await client.get("/v1/news", {"country": country.lower(), **params})
+            payload = await client.get("/v1/news", {"language": "en", "topic": topic, **params})
         except ApiError as exc:
             if "cursor" in params and exc.status in (400, 422):
                 paginator.fall_back()
                 params = paginator.next_params(previous_meta)
                 if params:
                     continue
-            log.error("%s: listing stopped after %d articles: %s", country, len(found), exc)
+            log.error("%s: listing stopped after %d articles: %s", topic, len(seen), exc)
             break
 
         items = [item for item in payload.get("data") or [] if item.get("uuid")]
-        new_items = [item for item in items if item["uuid"] not in found]
+        new_items = [item for item in items if item["uuid"] not in seen]
 
         if "cursor" in params and not new_items:
             paginator.fall_back()
@@ -523,11 +540,27 @@ async def list_country(
                 continue
             break
         if params and not new_items:
-            log.error("%s: paging returned no new articles, stopping", country)
+            log.error("%s: paging returned no new articles, stopping", topic)
             break
 
-        for item in new_items[: ARTICLES_PER_COUNTRY - len(found)]:
-            found[item["uuid"]] = item
+        seen.update(item["uuid"] for item in new_items)
+        stats.listed += len(new_items)
+
+        fresh = []
+        for item in new_items:
+            published = parse_timestamp(item.get("published_at"))
+            if published is not None and published < cutoff:
+                # Would be purged, then fetched again, on every later cycle.
+                stats.too_old += 1
+            else:
+                fresh.append(item)
+
+        stored = await store.existing_ids([item["uuid"] for item in fresh])
+        stats.already_stored += len(stored)
+        to_fetch = [item for item in fresh if item["uuid"] not in stored]
+        pending.update((item["uuid"], item) for item in to_fetch)
+        if not to_fetch:
+            break
 
         previous_meta = payload.get("meta") or {}
         if not previous_meta.get("has_more"):
@@ -536,66 +569,41 @@ async def list_country(
         if not params:
             break
 
-    if not found:
-        log.warning("%s: no articles listed", country)
-    return found
+    log.info("%s: %d articles read, %d new", topic, len(seen), len(pending))
+    return pending
 
 
-async def discover(client: NewsClient, stats: Stats, cutoff: datetime) -> dict[str, tuple[str, dict]]:
-    """Returns uuid -> (country, list item). Countries share the rate limiter, so
-    running them one at a time is no slower and keeps the paging fallback simple.
-    """
+async def discover(
+    client: NewsClient, store: SupabaseStore, stats: Stats, cutoff: datetime
+) -> dict[str, dict[str, Any]]:
     paginator = Paginator()
-    candidates: dict[str, tuple[str, dict]] = {}
-    for country in ANCHOR_COUNTRIES:
+    pending: dict[str, dict[str, Any]] = {}
+    for topic in FEED_TOPICS:
         try:
-            found = await list_country(client, country, paginator)
+            # An article in both feeds is only fetched once.
+            pending.update(await read_feed(client, store, topic, paginator, cutoff, stats))
         except StopIngestion:
             break
-        for uuid, item in found.items():
-            published = parse_timestamp(item.get("published_at"))
-            if published is not None and published < cutoff:
-                # Would be purged, then fetched again, on every later cycle.
-                stats.too_old += 1
-            elif uuid not in candidates:
-                candidates[uuid] = (country, item)
-        log.info("%s: %d articles listed", country, len(found))
-    stats.listed = len(candidates)
-    return candidates
+    return pending
 
 
 async def build_row(
-    client: NewsClient,
-    translator: Translator,
-    uuid: str,
-    country: str,
-    item: dict[str, Any],
-    now: datetime,
-    stats: Stats,
-) -> dict[str, Any]:
+    client: NewsClient, uuid: str, item: dict[str, Any], now: datetime, stats: Stats
+) -> dict[str, Any] | None:
     payload = await client.get("/v1/details", {"uuid": uuid})
     detail = payload.get("data") or {}
     stats.fetched += 1
 
-    title = (detail.get("title") or item.get("title") or "")[:MAX_TITLE_CHARS]
-    body = detail.get("body") or ""
-    total_sentences = len(split_sentences(body))
-    source = body[:EXCERPT_SOURCE_CHARS]
-
     languages = detail.get("languages") or []
-    language = languages[0].lower() if languages else None
-    is_english = bool(language and language.startswith("en"))
+    if languages and not languages[0].lower().startswith("en"):
+        stats.not_english += 1
+        return None
 
-    if not is_english:
-        try:
-            title = await translator.to_english(title)
-            source = await translator.to_english(source)
-        except TranslationFailed:
-            translator.failures.failure()
-            translator.failures.stop.check()
-            raise
-        translator.failures.success()
-        stats.translated += 1
+    title = detail.get("title") or item.get("title") or ""
+    excerpt = make_excerpt(detail.get("body") or "")
+    countries = tag_countries(title, excerpt)
+    stats.without_excerpt += not excerpt
+    stats.untagged += not countries
 
     published = (
         parse_timestamp(detail.get("published_at"))
@@ -607,13 +615,11 @@ async def build_row(
         "title": title,
         "source": detail.get("publisher") or item.get("publisher") or "",
         "published_at": published.isoformat(),
-        "country_code": country,
-        "excerpt": make_excerpt(source, total_sentences, len(body) > EXCERPT_SOURCE_CHARS),
+        "country_codes": countries,
+        "excerpt": excerpt,
         "thumbnail_url": http_url(detail.get("thumbnail")),
         "topics": detail.get("topics") or [],
         "original_url": http_url(detail.get("original_url")),
-        "original_language": language,
-        "is_translated": not is_english,
         "ingested_at": now.isoformat(),
     }
 
@@ -631,37 +637,26 @@ async def flush(store: SupabaseStore, buffer: list[dict[str, Any]], stats: Stats
 
 
 async def ingest(
-    client: NewsClient,
-    translator: Translator,
-    store: SupabaseStore,
-    stats: Stats,
-    now: datetime,
-    cutoff: datetime,
+    client: NewsClient, store: SupabaseStore, stats: Stats, now: datetime, cutoff: datetime
 ) -> None:
-    candidates = await discover(client, stats, cutoff)
-    existing = await store.existing_ids(list(candidates))
-    stats.already_stored = len(existing)
-    pending = {uuid: value for uuid, value in candidates.items() if uuid not in existing}
-    log.info("%d listed, %d already stored, %d to fetch", len(candidates), len(existing), len(pending))
+    pending = await discover(client, store, stats, cutoff)
+    log.info("%d listed, %d already stored, %d to fetch", stats.listed, stats.already_stored, len(pending))
 
     semaphore = asyncio.Semaphore(ARTICLE_CONCURRENCY)
 
-    async def process(uuid: str, country: str, item: dict[str, Any]) -> dict[str, Any] | None:
+    async def process(uuid: str, item: dict[str, Any]) -> dict[str, Any] | None:
         async with semaphore:
             try:
                 client.stop.check()
-                return await build_row(client, translator, uuid, country, item, now, stats)
+                return await build_row(client, uuid, item, now, stats)
             except StopIngestion:
                 return None
-            except (ApiError, TranslationFailed) as exc:
+            except ApiError as exc:
                 stats.failed += 1
                 log.warning("Skipping article %s: %s", uuid, exc)
                 return None
 
-    tasks = [
-        asyncio.create_task(process(uuid, country, item))
-        for uuid, (country, item) in pending.items()
-    ]
+    tasks = [asyncio.create_task(process(uuid, item)) for uuid, item in pending.items()]
     buffer: list[dict[str, Any]] = []
     for finished in asyncio.as_completed(tasks):
         row = await finished
@@ -716,7 +711,7 @@ async def run_cycle(store: SupabaseStore, api_key: str) -> int:
     try:
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             client = NewsClient(session, budget, stop)
-            await ingest(client, Translator(stop), store, stats, now, cutoff)
+            await ingest(client, store, stats, now, cutoff)
     finally:
         spent = client.used if client else 0
         await store.save_requests_used(day, used_today + spent)
@@ -727,8 +722,8 @@ async def run_cycle(store: SupabaseStore, api_key: str) -> int:
 
     if stop.fatal or stats.write_failures or stats.purge_failed:
         return 1
-    if stats.listed == 0 or (stats.fetched == 0 and stats.listed > stats.already_stored):
-        log.error("Nothing could be ingested in this cycle")
+    if stats.listed == 0:
+        log.error("The feeds returned no articles")
         return 1
     return 0
 
@@ -754,14 +749,7 @@ async def run() -> int:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    code = asyncio.run(run())
-    # deep_translator sets no HTTP timeout, and a hung worker thread would block a
-    # normal exit until the job limit marks a finished run as failed. All data is
-    # saved by this point.
-    logging.shutdown()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(code)
+    sys.exit(asyncio.run(run()))
 
 
 if __name__ == "__main__":

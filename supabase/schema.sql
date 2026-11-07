@@ -1,25 +1,29 @@
 -- Run once in the Supabase SQL editor. Safe to run again.
 
 create table if not exists public.articles (
-  id                text primary key,        -- the API's article UUID
-  title             text not null,
-  source            text not null default '',
-  published_at      timestamptz not null,
-  country_code      text not null,           -- ISO alpha-2, so the UK is GB
-  excerpt           text not null default '',-- whole sentences, in English
-  thumbnail_url     text,                    -- hosted by the publisher, may be null
-  topics            text[] not null default '{}',
-  original_url      text,
-  original_language text,
-  is_translated     boolean not null default false,
-  ingested_at       timestamptz not null default now()
+  id            text primary key,         -- the API's article UUID
+  title         text not null,
+  source        text not null default '',
+  published_at  timestamptz not null,
+  country_codes text[] not null default '{}', -- anchor countries it's about, ISO alpha-2 (UK is GB)
+  excerpt       text not null default '', -- whole sentences; empty if no clean text was found
+  thumbnail_url text,                     -- hosted by the publisher, may be null
+  topics        text[] not null default '{}',
+  original_url  text,
+  ingested_at   timestamptz not null default now()
 );
 
--- Dashboard: newest articles overall, and newest per country.
+-- Brings tables created by the first version of this file up to date.
+alter table public.articles add column if not exists country_codes text[] not null default '{}';
+alter table public.articles drop column if exists country_code;
+alter table public.articles drop column if exists original_language;
+alter table public.articles drop column if exists is_translated;
+
+-- Dashboard: newest articles overall, and articles by country.
 create index if not exists articles_published_at_idx
   on public.articles (published_at desc);
-create index if not exists articles_country_published_at_idx
-  on public.articles (country_code, published_at desc);
+create index if not exists articles_country_codes_idx
+  on public.articles using gin (country_codes);
 -- 7-day purge.
 create index if not exists articles_ingested_at_idx
   on public.articles (ingested_at);
